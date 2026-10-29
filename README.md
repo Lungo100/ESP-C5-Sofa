@@ -64,6 +64,21 @@ der Port als erstes Argument übergeben, z. B. `./start_drive.sh /dev/ttyACM1`.
 **Beenden:** `Ctrl-C` (bzw. `Ctrl-]` in der mpremote-REPL). Beim Beenden werden
 die Motoren automatisch gestoppt und die Bremsen angezogen.
 
+## Fahrwerks-Ausrichtung (`DRIVE_ORIENTATION`)
+
+Die Antriebsbasis ist nicht fest mit dem Sofa verbunden – das Sofa lässt sich
+um 180° auf der Basis drehen. Je nachdem, ob die angetriebenen Räder hinten
+oder vorn liegen, fährt sich das Fahrzeug unterschiedlich:
+
+| `DRIVE_ORIENTATION` | Räder       | Verhalten |
+| ------------------- | ----------- | --------- |
+| `"rear"` (Default)  | angetrieben hinten, Rollen vorn | stabil (Untersteuern) |
+| `"front"`           | angetrieben vorn, Rollen hinten | driftig (Übersteuern) |
+
+Die Einstellung steht in `drive_controller.py` und schaltet `DRIVE_SIGN` und
+`STEER_SIGN` gemeinsam um (Fahrtrichtung + Lenkrichtung). Ein Laufzeit-Schalter
+für den schnellen Wechsel ist vorgesehen, aber noch nicht umgesetzt.
+
 ## Ablauf von `drive_controller.py`
 
 1. Beim Start: Joystick loslassen → Mitte wird kalibriert.

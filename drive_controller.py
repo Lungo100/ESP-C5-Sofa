@@ -20,8 +20,18 @@ ACCEL = 140.0
 DECEL = 240.0
 STEER_EXPO = 1.8
 STEER_GAIN = 1.0
-DRIVE_SIGN = -1
-STEER_SIGN = -1
+
+# Anordnung der angetriebenen Räder relativ zur Sitzrichtung:
+#   "rear"  = angetrieben hinten, Rollen vorn   (stabil, Default)
+#   "front" = angetrieben vorn,  Rollen hinten  (Drift-Modus)
+DRIVE_ORIENTATION = "rear"
+
+if DRIVE_ORIENTATION == "rear":
+    DRIVE_SIGN = 1
+    STEER_SIGN = 1
+else:
+    DRIVE_SIGN = -1
+    STEER_SIGN = -1
 
 BRAKE_HOLD = True
 BRAKE_AT_CENTER = True
