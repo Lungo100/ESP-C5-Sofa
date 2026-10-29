@@ -15,7 +15,7 @@ CAL_FILE = "cal.txt"
 SAVE_CAL = True
 RECALIBRATE = True
 
-MAX_POWER_FWD = 50
+MAX_POWER_FWD = 75
 MAX_POWER_REV = 50
 LEFT_TRIM_FWD = 36
 LEFT_TRIM_REV = 40
@@ -24,7 +24,7 @@ DECEL = 80.0
 SOFT_DECEL = 80.0   # sanftes Ausrollen beim Richtungswechsel
 BRAKE_MS = 400      # Bremse während Richtungswechsel (ms)
 STEER_EXPO = 1.8
-STEER_GAIN = 1.0
+STEER_GAIN = 0.35
 
 # Anordnung der angetriebenen Räder relativ zur Sitzrichtung:
 #   "rear"  = angetrieben hinten, Rollen vorn   (stabil, Default)
@@ -151,6 +151,8 @@ class Motor:
         self.inverted = inverted
         self.forward = None
         self.cur = 0.0
+        self.direction = 1    # logische Fahrtrichtung: 1 vor, -1 rueck
+        self.brake_since = 0  # Brems-Timer beim Richtungswechsel
         self.brake_on()
 
     def _duty(self, percent):
@@ -181,15 +183,46 @@ class Motor:
     def set_brake(self, on):
         self.brake.value(BRAKE_ACTIVE_LEVEL if on else 1 - BRAKE_ACTIVE_LEVEL)
 
-    def set_signed(self, percent):
-        if percent == 0.0:
-            self._duty(0.0)
-            return
-        fwd = percent > 0.0
-        if fwd != self.forward:
-            self._duty(0.0)
-            self._set_dir(fwd)
+    def _apply(self, percent):
+        self._set_dir(self.direction > 0)
         self._duty(abs(percent))
+
+    def drive_soft(self, target, dt):
+        want = self.direction if target == 0.0 else (1 if target > 0.0 else -1)
+
+        if want != self.direction:
+            if abs(self.cur) < 0.5:
+                # schon im Stand -> Richtung sofort uebernehmen (kein Warten)
+                self.direction = want
+                self.brake_since = 0
+                self.cur = ramp_cur(self.cur, target, dt)
+                self.set_brake(False)
+                self._apply(self.cur)
+            else:
+                # abbremsen -> Bremse anziehen -> umschalten
+                self.cur = ramp_cur(self.cur, 0.0, dt, decel=SOFT_DECEL)
+                if self.cur == 0.0:
+                    self.set_brake(True)
+                    now = time.ticks_ms()
+                    if self.brake_since == 0:
+                        self.brake_since = now
+                    elif time.ticks_diff(now, self.brake_since) >= BRAKE_MS:
+                        self.set_brake(False)
+                        self.direction = want
+                        self.brake_since = 0
+                self._apply(self.cur)
+        elif target == 0.0:
+            # Neutral: ausrollen + Bremse halten
+            self.cur = ramp_cur(self.cur, 0.0, dt, decel=SOFT_DECEL)
+            self.set_brake(BRAKE_HOLD if abs(self.cur) < 0.5 else False)
+            self.brake_since = 0
+            self._apply(self.cur)
+        else:
+            # normale Fahrt
+            self.cur = ramp_cur(self.cur, target, dt)
+            self.set_brake(False)
+            self.brake_since = 0
+            self._apply(self.cur)
 
     def stop(self):
         self.cur = 0.0
@@ -316,8 +349,6 @@ print("Bereit. Ctrl-C beendet.")
 
 last = time.ticks_ms()
 tick = 0
-direction = 1     # aktuelle Fahrtrichtung: 1 vorwaerts, -1 rueckwaerts
-brake_since = 0   # Zeitpunkt, seit dem die Bremse beim Richtungswechsel anliegt
 
 try:
     while True:
@@ -351,52 +382,20 @@ try:
 
         trim = LEFT_TRIM_REV if throttle < 0 else LEFT_TRIM_FWD
         left *= 1.0 + trim / 100.0
+        if left > 100.0:
+            left = 100.0
+        elif left < -100.0:
+            left = -100.0
 
-        # Richtungswechsel (reference): abbremsen -> Bremse kurz anziehen ->
-        # Richtung umschalten. Kein Neutral noetig. Pivot (Lenken ohne Gas)
-        # bleibt unveraendert.
-        want_forward = direction if y == 0 else (1 if y > 0 else -1)
-
-        cur_l = motor_l.cur
-        cur_r = motor_r.cur
-        brake_on = False
-
-        if want_forward != direction:
-            cur_l = ramp_cur(cur_l, 0.0, dt, decel=SOFT_DECEL)
-            cur_r = ramp_cur(cur_r, 0.0, dt, decel=SOFT_DECEL)
-            if cur_l == 0.0 and cur_r == 0.0:
-                brake_on = True
-                now = time.ticks_ms()
-                if brake_since == 0:
-                    brake_since = now
-                elif time.ticks_diff(now, brake_since) >= BRAKE_MS:
-                    brake_on = False
-                    direction = want_forward
-                    brake_since = 0
-        elif y == 0 and x == 0:
-            cur_l = ramp_cur(cur_l, 0.0, dt, decel=SOFT_DECEL)
-            cur_r = ramp_cur(cur_r, 0.0, dt, decel=SOFT_DECEL)
-            if cur_l == 0.0 and cur_r == 0.0:
-                brake_on = BRAKE_HOLD
-            brake_since = 0
-        else:
-            cur_l = ramp_cur(cur_l, left, dt)
-            cur_r = ramp_cur(cur_r, right, dt)
-            brake_since = 0
-
-        motor_l.set_brake(brake_on)
-        motor_r.set_brake(brake_on)
-        motor_l.cur = cur_l
-        motor_r.cur = cur_r
-        motor_l.set_signed(cur_l)
-        motor_r.set_signed(cur_r)
+        # Richtungswechsel je Rad: abbremsen -> Bremse kurz anziehen ->
+        # Richtung umschalten (deckt Gas-Wechsel UND Lenk-/Pivot-Wechsel ab).
+        motor_l.drive_soft(left, dt)
+        motor_r.drive_soft(right, dt)
 
         tick += 1
         if tick % 50 == 0:
-            print("X %+4d  Y %+4d  L %+6.1f  R %+6.1f  %s%s"
-                  % (x, y, cur_l, cur_r,
-                     "vor" if direction > 0 else "rueck",
-                     "  BREMS" if brake_on else ""))
+            print("X %+4d  Y %+4d  L %+6.1f  R %+6.1f"
+                  % (x, y, motor_l.cur, motor_r.cur))
 
         elapsed = time.ticks_diff(time.ticks_ms(), loop_start)
         if elapsed < LOOP_MS:
