@@ -4,7 +4,7 @@ from machine import Pin, PWM, ADC
 PWM_FREQ = 1000
 LOOP_MS = 20
 ADC_SAMPLES = 6
-DEADZONE = 20
+DEADZONE = 40
 CENTER_MS = 1200
 CENTER_SETTLE_MS = 800
 CENTER_STABLE = 2500
@@ -19,8 +19,10 @@ MAX_POWER_FWD = 50
 MAX_POWER_REV = 50
 LEFT_TRIM_FWD = 36
 LEFT_TRIM_REV = 40
-ACCEL = 140.0
-DECEL = 240.0
+ACCEL = 60.0
+DECEL = 80.0
+SOFT_DECEL = 80.0   # sanftes Ausrollen beim Richtungswechsel
+BRAKE_MS = 400      # Bremse während Richtungswechsel (ms)
 STEER_EXPO = 1.8
 STEER_GAIN = 1.0
 
@@ -124,6 +126,23 @@ def build_curve(expo, gain):
 STEER_CURVE = build_curve(STEER_EXPO, STEER_GAIN)
 
 
+def ramp_cur(cur, target, dt, decel=None):
+    """Zeitbasierte Rampe: beschleunigt mit ACCEL, bremst mit decel (default DECEL)."""
+    if decel is None:
+        decel = DECEL
+    if cur < target:
+        nxt = cur + ACCEL * dt
+        if nxt > target:
+            nxt = target
+    else:
+        nxt = cur - decel * dt
+        if nxt < target:
+            nxt = target
+    if (cur > 0.0 and nxt < 0.0) or (cur < 0.0 and nxt > 0.0):
+        nxt = 0.0
+    return nxt
+
+
 class Motor:
     def __init__(self, pwm_pin, dir_pin, brake_pin, inverted=False):
         self.pwm, self.use_u16 = pwm_init(pwm_pin)
@@ -159,35 +178,18 @@ class Motor:
     def brake_off(self):
         self.brake.value(1 - BRAKE_ACTIVE_LEVEL)
 
-    def drive(self, target, dt):
-        if self.cur < target:
-            nxt = self.cur + ACCEL * dt
-            if nxt > target:
-                nxt = target
-        else:
-            nxt = self.cur - DECEL * dt
-            if nxt < target:
-                nxt = target
+    def set_brake(self, on):
+        self.brake.value(BRAKE_ACTIVE_LEVEL if on else 1 - BRAKE_ACTIVE_LEVEL)
 
-        if (self.cur > 0.0 and nxt < 0.0) or (self.cur < 0.0 and nxt > 0.0):
-            nxt = 0.0
-        self.cur = nxt
-
-        if abs(self.cur) < 0.5:
+    def set_signed(self, percent):
+        if percent == 0.0:
             self._duty(0.0)
-            if abs(target) < 0.5:
-                if BRAKE_HOLD:
-                    self.brake_on()
-                else:
-                    self.brake_off()
             return
-
-        self.brake_off()
-        forward = self.cur > 0.0
-        if forward != self.forward:
+        fwd = percent > 0.0
+        if fwd != self.forward:
             self._duty(0.0)
-            self._set_dir(forward)
-        self._duty(abs(self.cur))
+            self._set_dir(fwd)
+        self._duty(abs(percent))
 
     def stop(self):
         self.cur = 0.0
@@ -295,21 +297,11 @@ except Exception as e:
     stop_all()
     raise SystemExit
 
-cal = None if RECALIBRATE else load_cal()
-if cal is None:
-    print("Joystick loslassen - Mitte kalibrieren ...")
-    time.sleep_ms(CENTER_SETTLE_MS)
-    center_x, center_y = read_center_both(adc_x, adc_y, CENTER_MS)
-    print("Joystick %d s lang in alle Richtungen bewegen ..." % (RANGE_MS // 1000))
-    min_x, max_x, min_y, max_y = read_range_both(
-        adc_x, adc_y, center_x, center_y, RANGE_MS
-    )
-    if SAVE_CAL:
-        save_cal((center_x, center_y, min_x, max_x, min_y, max_y))
-        print("Kalibrierung gespeichert")
-else:
-    center_x, center_y, min_x, max_x, min_y, max_y = cal
-    print("Kalibrierung geladen")
+# Kalibrierung übersprungen: feste (gemessene) Werte.
+# Stick-Drift wird über die Totzone (DEADZONE) abgefangen.
+center_x, center_y = 27121, 6911
+min_x, max_x = 40, 54241
+min_y, max_y = 2052, 17987
 
 print("Mitte X=%d Y=%d  Bereich X=%d..%d Y=%d..%d"
       % (center_x, center_y, min_x, max_x, min_y, max_y))
@@ -324,6 +316,8 @@ print("Bereit. Ctrl-C beendet.")
 
 last = time.ticks_ms()
 tick = 0
+direction = 1     # aktuelle Fahrtrichtung: 1 vorwaerts, -1 rueckwaerts
+brake_since = 0   # Zeitpunkt, seit dem die Bremse beim Richtungswechsel anliegt
 
 try:
     while True:
@@ -358,17 +352,51 @@ try:
         trim = LEFT_TRIM_REV if throttle < 0 else LEFT_TRIM_FWD
         left *= 1.0 + trim / 100.0
 
-        if BRAKE_AT_CENTER and x == 0 and y == 0:
-            motor_l.stop()
-            motor_r.stop()
+        # Richtungswechsel (reference): abbremsen -> Bremse kurz anziehen ->
+        # Richtung umschalten. Kein Neutral noetig. Pivot (Lenken ohne Gas)
+        # bleibt unveraendert.
+        want_forward = direction if y == 0 else (1 if y > 0 else -1)
+
+        cur_l = motor_l.cur
+        cur_r = motor_r.cur
+        brake_on = False
+
+        if want_forward != direction:
+            cur_l = ramp_cur(cur_l, 0.0, dt, decel=SOFT_DECEL)
+            cur_r = ramp_cur(cur_r, 0.0, dt, decel=SOFT_DECEL)
+            if cur_l == 0.0 and cur_r == 0.0:
+                brake_on = True
+                now = time.ticks_ms()
+                if brake_since == 0:
+                    brake_since = now
+                elif time.ticks_diff(now, brake_since) >= BRAKE_MS:
+                    brake_on = False
+                    direction = want_forward
+                    brake_since = 0
+        elif y == 0 and x == 0:
+            cur_l = ramp_cur(cur_l, 0.0, dt, decel=SOFT_DECEL)
+            cur_r = ramp_cur(cur_r, 0.0, dt, decel=SOFT_DECEL)
+            if cur_l == 0.0 and cur_r == 0.0:
+                brake_on = BRAKE_HOLD
+            brake_since = 0
         else:
-            motor_l.drive(left, dt)
-            motor_r.drive(right, dt)
+            cur_l = ramp_cur(cur_l, left, dt)
+            cur_r = ramp_cur(cur_r, right, dt)
+            brake_since = 0
+
+        motor_l.set_brake(brake_on)
+        motor_r.set_brake(brake_on)
+        motor_l.cur = cur_l
+        motor_r.cur = cur_r
+        motor_l.set_signed(cur_l)
+        motor_r.set_signed(cur_r)
 
         tick += 1
         if tick % 50 == 0:
-            print("X %+4d  Y %+4d  L %+6.1f  R %+6.1f"
-                  % (x, y, left, right))
+            print("X %+4d  Y %+4d  L %+6.1f  R %+6.1f  %s%s"
+                  % (x, y, cur_l, cur_r,
+                     "vor" if direction > 0 else "rueck",
+                     "  BREMS" if brake_on else ""))
 
         elapsed = time.ticks_diff(time.ticks_ms(), loop_start)
         if elapsed < LOOP_MS:
