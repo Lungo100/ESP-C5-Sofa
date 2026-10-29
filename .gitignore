@@ -1,0 +1,9 @@
+# Virtuelle Umgebung
+.venv/
+
+# Python-Bytecode
+__pycache__/
+*.pyc
+
+# Kalibrierungsdatei (entsteht auf dem Board, nicht hier)
+cal.txt
