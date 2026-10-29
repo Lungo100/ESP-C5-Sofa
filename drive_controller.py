@@ -15,7 +15,10 @@ CAL_FILE = "cal.txt"
 SAVE_CAL = True
 RECALIBRATE = True
 
-MAX_POWER = 100
+MAX_POWER_FWD = 50
+MAX_POWER_REV = 50
+LEFT_TRIM_FWD = 36
+LEFT_TRIM_REV = 40
 ACCEL = 140.0
 DECEL = 240.0
 STEER_EXPO = 1.8
@@ -233,8 +236,8 @@ def read_range_both(adc_x, adc_y, cx, cy, ms):
     min_y = max_y = cy
     t0 = time.ticks_ms()
     while time.ticks_diff(time.ticks_ms(), t0) < ms:
-        rx = adc_x.read_u16()
-        ry = adc_y.read_u16()
+        rx = read_avg(adc_x)
+        ry = read_avg(adc_y)
         if rx < min_x:
             min_x = rx
         elif rx > max_x:
@@ -338,17 +341,22 @@ try:
         steer = STEER_CURVE[x + 100] * STEER_SIGN
         throttle = y * DRIVE_SIGN
 
-        left = (throttle + steer) * MAX_POWER / 100.0
-        right = (throttle - steer) * MAX_POWER / 100.0
+        power = MAX_POWER_REV if throttle < 0 else MAX_POWER_FWD
 
-        if left > MAX_POWER:
-            left = MAX_POWER
-        elif left < -MAX_POWER:
-            left = -MAX_POWER
-        if right > MAX_POWER:
-            right = MAX_POWER
-        elif right < -MAX_POWER:
-            right = -MAX_POWER
+        left = (throttle + steer) * power / 100.0
+        right = (throttle - steer) * power / 100.0
+
+        if left > power:
+            left = power
+        elif left < -power:
+            left = -power
+        if right > power:
+            right = power
+        elif right < -power:
+            right = -power
+
+        trim = LEFT_TRIM_REV if throttle < 0 else LEFT_TRIM_FWD
+        left *= 1.0 + trim / 100.0
 
         if BRAKE_AT_CENTER and x == 0 and y == 0:
             motor_l.stop()
